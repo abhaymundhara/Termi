@@ -4,9 +4,7 @@
 
 ## Install
 ```bash
-pipx install termi
-# or
-pip install termi
+pip install termi-copilot
 ```
 
 ## Usage
