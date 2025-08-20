@@ -29,15 +29,14 @@ Homepage = "https://github.com/abhaymundhara/Termi"
 Issues = "https://github.com/abhaymundhara/Termi/issues"
 
 [project.scripts]
-termi = "cli:main"
+termi = "termi.cli:main"
 
-# Tell Hatchling we're using a src/ layout
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src/termi"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-  "src",
+  "src/termi",
   "pyproject.toml",
   "LICENSE",
   "README.md",
