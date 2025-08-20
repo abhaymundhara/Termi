@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "termi"
+version = "0.1.0"
+description = "Local-LLM terminal copilot that turns natural language into shell commands."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["terminal", "llm", "ollama", "copilot"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Environment :: Console",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourname/termi"
+Issues = "https://github.com/yourname/termi/issues"
+
+[project.scripts]
+termi = "termi.cli:main"
+
+---
