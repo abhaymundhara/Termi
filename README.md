@@ -13,8 +13,8 @@ pip install termi-copilot
 
 ## Usage
 ```bash
-termi
-termi "find large files in ~/Downloads"
+termi       #interactive
+# or
 termi --explain "find . -type f -size +100M -print0 | xargs -0 ls -lh"
 termi --dry-run "rm -rf /tmp/test"
 termi --model llama3:latest "list all active network connections"
