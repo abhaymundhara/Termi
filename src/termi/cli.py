@@ -16,7 +16,7 @@ import re
 try:
     import importlib.metadata as _im
     __version__ = _im.version("termi-copilot")
-except (ImportError, Exception):
+except ImportError:
     __version__ = "dev"
 
 # Default Ollama REST endpoint (we'll swap to /api/chat in requests)
@@ -29,6 +29,11 @@ SHELL = os.environ.get("SHELL", "/bin/zsh")
 _PARSED_OLLAMA_URL = urllib.parse.urlparse(OLLAMA_URL)
 OLLAMA_HOST = _PARSED_OLLAMA_URL.hostname or "localhost"
 OLLAMA_PORT = _PARSED_OLLAMA_URL.port or 11434
+
+# Server polling configuration
+_POLL_INITIAL_DELAY = 0.2  # Initial delay in seconds
+_POLL_MAX_DELAY = 2.0      # Maximum delay between polls
+_POLL_BACKOFF_STEP = 3     # Increase delay every N iterations
 
 # --- Core prompts -------------------------------------------------------------------
 
@@ -164,11 +169,12 @@ def ensure_ollama_running() -> None:
             sys.exit(rc)
 
     # Wait for server with exponential backoff
-    # Using stepped exponential: increases every 3 iterations to balance responsiveness vs waiting
+    # Using stepped exponential: increases every N iterations to balance responsiveness vs waiting
     for i in range(15):
         if is_port_open(OLLAMA_HOST, OLLAMA_PORT):
             return
-        time.sleep(min(0.2 * (2 ** (i // 3)), 2.0))  # Capped at 2s to avoid excessive delays
+        delay = min(_POLL_INITIAL_DELAY * (2 ** (i // _POLL_BACKOFF_STEP)), _POLL_MAX_DELAY)
+        time.sleep(delay)
     print_err("✗ Ollama server did not become ready on", f"{OLLAMA_HOST}:{OLLAMA_PORT}")
     sys.exit(1)
 
@@ -177,10 +183,12 @@ def ensure_model_available(model: str) -> None:
     if not shutil.which("ollama"):
         return
     try:
-        out = subprocess.check_output(["ollama", "list"], text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(["ollama", "list"], text=True, stderr=subprocess.PIPE)
         if model in out:
             return
-    except (subprocess.CalledProcessError, OSError):
+    except (subprocess.CalledProcessError, OSError) as e:
+        # If ollama list fails, log for debugging but continue
+        print_err(f"Note: Could not verify model availability: {e}")
         pass
     
     print(f"Model '{model}' not found locally.")
