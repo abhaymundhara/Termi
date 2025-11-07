@@ -16,8 +16,8 @@ import re
 
 try:
     import importlib.metadata as _im
-    __version__ = _im.version("termi")
-except Exception:
+    __version__ = _im.version("termi-copilot")
+except (ImportError, Exception):
     __version__ = "dev"
 
 # Default Ollama REST endpoint (we'll swap to /api/chat in requests)
@@ -125,9 +125,11 @@ def install_ollama() -> int:
 
 def run_in_new_terminal_mac(command: str) -> int:
     """Open a new macOS Terminal window running the given command."""
+    # Use proper escaping for AppleScript
+    escaped_cmd = command.replace('\\', '\\\\').replace('"', '\\"')
     osa = (
         'osascript -e '
-        '"tell application \\"Terminal\\" to do script \\"' + command.replace('"', '\\"') + '\\""'
+        '"tell application \\"Terminal\\" to do script \\"' + escaped_cmd + '\\""'
     )
     return run_command(osa)
 
@@ -267,22 +269,41 @@ def which_exists(token: str) -> bool:
     return shutil.which(token) is not None
 
 def looks_like_command(s: str) -> bool:
+    """Check if string looks like a valid command with improved validation."""
+    if not s or not s.strip():
+        return False
+    
     try:
         parts = shlex.split(s)
     except ValueError:
         return False
+    
     return len(parts) > 0 and which_exists(parts[0])
 
 def run_command(cmd: str) -> int:
+    """Execute a shell command with proper error handling."""
+    if not cmd or not cmd.strip():
+        print_err("✗ Empty command, nothing to run.")
+        return 1
+    
     try:
         p = subprocess.run(cmd, shell=True, executable=SHELL)
         return p.returncode
     except KeyboardInterrupt:
         return 130
+    except Exception as e:
+        print_err(f"✗ Error executing command: {e}")
+        return 1
 
 def ask_yes_no(prompt: str, default="n") -> bool:
+    """Ask user for yes/no confirmation with proper error handling."""
     prompt_full = f"{prompt} [{'Y/n' if default=='y' else 'y/N'}]: "
-    ans = input(prompt_full).strip().lower()
+    try:
+        ans = input(prompt_full).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    
     if not ans:
         ans = default
     return ans in ("y", "yes")
