@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-import os, sys, json, shlex, shutil, subprocess, textwrap, urllib.request, urllib.error, urllib.parse, time, platform, socket
+import os
+import sys
+import json
+import shlex
+import shutil
+import subprocess
+import textwrap
+import urllib.request
+import urllib.error
+import urllib.parse
+import time
+import platform
+import socket
+import re
 
 try:
     import importlib.metadata as _im
@@ -12,6 +25,11 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 # Fast default model; override with --model or TERMI_MODEL
 DEFAULT_MODEL = os.environ.get("TERMI_MODEL", "gemma2:2b")
 SHELL = os.environ.get("SHELL", "/bin/zsh")
+
+# Cache parsed URL to avoid repeated parsing
+_PARSED_OLLAMA_URL = urllib.parse.urlparse(OLLAMA_URL)
+OLLAMA_HOST = _PARSED_OLLAMA_URL.hostname or "localhost"
+OLLAMA_PORT = _PARSED_OLLAMA_URL.port or 11434
 
 # --- Core prompts -------------------------------------------------------------------
 
@@ -83,13 +101,14 @@ def print_err(*a): print(*a, file=sys.stderr)
 # --- Network / environment helpers --------------------------------------------------
 
 def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        try:
+    """Check if a port is open with proper error handling."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
             sock.connect((host, port))
             return True
-        except OSError:
-            return False
+    except (OSError, socket.error):
+        return False
 
 def prompt_install_ollama() -> bool:
     print("Ollama is not installed.")
@@ -124,13 +143,10 @@ def ensure_ollama_installed() -> None:
         sys.exit(rc)
 
 def ensure_ollama_running() -> None:
-    parsed = urllib.parse.urlparse(OLLAMA_URL)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 11434
-    if is_port_open(host, port):
+    if is_port_open(OLLAMA_HOST, OLLAMA_PORT):
         return
 
-    print("Ollama server not detected on", f"{host}:{port}")
+    print("Ollama server not detected on", f"{OLLAMA_HOST}:{OLLAMA_PORT}")
     if not ask_yes_no("Start Ollama server in a new Terminal window?", default="y"):
         print_err("✗ Ollama server not running. Exiting.")
         sys.exit(1)
@@ -146,22 +162,25 @@ def ensure_ollama_running() -> None:
             print_err("✗ Failed to start ollama serve (exit", rc, ")")
             sys.exit(rc)
 
-    for _ in range(30):
-        if is_port_open(host, port):
+    # Wait for server with exponential backoff
+    for i in range(15):
+        if is_port_open(OLLAMA_HOST, OLLAMA_PORT):
             return
-        time.sleep(0.2)
-    print_err("✗ Ollama server did not become ready on", f"{host}:{port}")
+        time.sleep(min(0.2 * (2 ** (i // 3)), 2.0))  # Exponential backoff capped at 2s
+    print_err("✗ Ollama server did not become ready on", f"{OLLAMA_HOST}:{OLLAMA_PORT}")
     sys.exit(1)
 
 def ensure_model_available(model: str) -> None:
+    """Check if model is available, with improved error handling."""
     if not shutil.which("ollama"):
         return
     try:
-        out = subprocess.check_output(["ollama", "list"], text=True)
+        out = subprocess.check_output(["ollama", "list"], text=True, stderr=subprocess.DEVNULL)
         if model in out:
             return
-    except Exception:
+    except (subprocess.CalledProcessError, OSError):
         pass
+    
     print(f"Model '{model}' not found locally.")
     if ask_yes_no(f"Pull '{model}' now?", default="y"):
         rc = run_command(f"ollama pull {shlex.quote(model)}")
@@ -173,13 +192,23 @@ def ensure_model_available(model: str) -> None:
 # --- Parsing helpers ----------------------------------------------------------------
 
 def _parse_cmd_from_response(text: str) -> str:
-    t = text.strip().strip('`')
+    """Parse command from LLM response, handling JSON and fallback to plain text."""
+    t = text.strip()
+    if not t:
+        return ""
+    
+    # Remove backticks if present
+    if t.startswith('`'):
+        t = t.strip('`')
+    
     try:
         obj = json.loads(t)
         if isinstance(obj, dict) and "cmd" in obj and isinstance(obj["cmd"], str):
             return obj["cmd"].strip()
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         pass
+    
+    # Fallback: return first non-empty line
     for line in t.splitlines():
         line = line.strip()
         if line:
@@ -187,17 +216,34 @@ def _parse_cmd_from_response(text: str) -> str:
     return ""
 
 def _parse_explanation_from_response(text: str) -> str:
-    t = text.strip().strip('`')
+    """Parse explanation from LLM response, handling JSON and fallback to plain text."""
+    t = text.strip()
+    if not t:
+        return ""
+    
+    # Remove backticks if present
+    if t.startswith('`'):
+        t = t.strip('`')
+    
     try:
         obj = json.loads(t)
         if isinstance(obj, dict) and "explanation" in obj and isinstance(obj["explanation"], str):
             return obj["explanation"].strip()
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         pass
+    
     return t
 
 def _parse_plan_from_response(text: str):
-    t = text.strip().strip('`')
+    """Parse plan from LLM response with improved error handling."""
+    t = text.strip()
+    if not t:
+        return [], ""
+    
+    # Remove backticks if present
+    if t.startswith('`'):
+        t = t.strip('`')
+    
     try:
         obj = json.loads(t)
         if isinstance(obj, dict) and "plan" in obj and isinstance(obj["plan"], list):
@@ -210,8 +256,9 @@ def _parse_plan_from_response(text: str):
                     })
             notes = str(obj.get("notes", "")).strip()
             return steps, notes
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         pass
+    
     return [], ""
 
 # --- Simple shell helpers ------------------------------------------------------------
@@ -242,15 +289,24 @@ def ask_yes_no(prompt: str, default="n") -> bool:
 
 # --- Heuristic fallback (only when Ollama is unavailable) ----------------------------
 
+# Pre-compiled regex patterns for efficiency
+_RE_TOP_N = re.compile(r"top\s+(\d+)")
+_RE_SIZE_PATTERN = re.compile(r"(\d+)\s*(m|mb|g|gb)\b")
+_RE_QUOTED_TEXT = re.compile(r'"([^"]+)"|\'([^\']+)\'')
+_RE_FILE_EXT = re.compile(r'\.(\w+)$')
+_RE_NAME_PATTERN = re.compile(r'name\s+([\w\-\.]+)')
+
 def _fallback_command(nl: str) -> str:
+    """Generate fallback command based on heuristics when LLM is unavailable."""
     s = nl.strip().lower()
-    # large files first
+    
+    # Large files first
     if ("large" in s or "largest" in s or "big" in s or "biggest" in s or "huge" in s) and ("file" in s or "files" in s):
-        import re
-        m = re.search(r"top\s+(\d+)", s)
+        m = _RE_TOP_N.search(s)
         top = int(m.group(1)) if m else 20
+        
         thresh = "+100M"
-        m2 = re.search(r"(\d+)\s*(m|mb|g|gb)\b", s)
+        m2 = _RE_SIZE_PATTERN.search(s)
         if m2:
             qty, unit = m2.groups()
             unit = unit.lower()
@@ -259,67 +315,72 @@ def _fallback_command(nl: str) -> str:
             elif unit in ("g", "gb"):
                 thresh = f"+{qty}G"
         return f"find . -type f -size {thresh} -print0 | xargs -0 ls -lh | sort -k5 -h | tail -n {top}"
-    # disk usage
+    
+    # Disk usage
     if ("disk" in s and "usage" in s) or ("space" in s and ("used" in s or "free" in s)):
         return "du -sh * | sort -h"
-    # free space
+    
+    # Free space
     if "free space" in s or ("how much space" in s):
         return "df -h"
-    # search text
+    
+    # Search text
     if ("search" in s or "find" in s) and ("text" in s or "string" in s or " for " in s):
-        import re
-        m = re.search(r'"([^"]+)"|\'([^\']+)\'', nl)
+        m = _RE_QUOTED_TEXT.search(nl)
         term = m.group(1) if m and m.group(1) is not None else (m.group(2) if m else None)
         if term:
             return f"grep -RIn {shlex.quote(term)} ."
         return "grep -RIn ."
-    # find by extension/name
+    
+    # Find by extension/name
     if "find" in s and ("file" in s or "files" in s or "name" in s or s.strip().endswith(('.py', '.js', '.txt'))):
-        import re
-        m = re.search(r'\.(\w+)$', s)
+        m = _RE_FILE_EXT.search(s)
         if m:
             ext = m.group(1)
             return f"find . -type f -iname '*.{ext}'"
-        m = re.search(r'name\s+([\w\-\.]+)', s)
+        
+        m = _RE_NAME_PATTERN.search(s)
         if m:
             pattern = m.group(1)
             return f"find . -type f -iname {shlex.quote(pattern)}"
         return "find . -type f -maxdepth 3 -print"
-    # processes
+    
+    # Processes
     if "process" in s or "processes" in s or "running apps" in s:
         return "ps aux | less"
-    # ports
+    
+    # Ports
     if "open ports" in s or ("ports" in s and "listen" in s):
         return "lsof -i -P | grep LISTEN"
-    # ip
+    
+    # IP address
     if "ip address" in s or "my ip" in s:
         return "ipconfig getifaddr en0 || ipconfig getifaddr en1 || hostname -I"
-    # system info
+    
+    # System info
     if "system info" in s or "os version" in s:
         return "sw_vers && uname -a"
-    # git basics
+    
+    # Git basics
     if s.startswith("git status") or "git status" in s:
         return "git status"
     if "pull" in s and "git" in s:
         return "git pull --ff-only"
     if "show branches" in s or ("git" in s and "branch" in s):
         return "git branch -vv"
-    # generic list
+    
+    # Generic list (default)
     if ("list" in s or "show" in s) and ("files" in s or "dir" in s or "directory" in s or "here" in s or "current" in s):
         return "ls -la"
+    
     return "ls -la"
 
 # --- LLM calls ----------------------------------------------------------------------
 
 def call_ollama(prompt: str, model: str, explain: bool=False) -> str:
+    """Call Ollama API with improved error handling and caching."""
     # Ensure server reachable; start if needed
-    try:
-        parsed = urllib.parse.urlparse(OLLAMA_URL)
-        host = parsed.hostname or "localhost"
-        port = parsed.port or 11434
-        if not is_port_open(host, port):
-            raise urllib.error.URLError("ollama not reachable")
-    except Exception:
+    if not is_port_open(OLLAMA_HOST, OLLAMA_PORT):
         print_err("Ollama not reachable; attempting to start server...")
         ensure_ollama_running()
 
@@ -371,10 +432,8 @@ def call_ollama(prompt: str, model: str, explain: bool=False) -> str:
         raise e
 
 def call_ollama_chat(message: str, model: str) -> str:
-    parsed = urllib.parse.urlparse(OLLAMA_URL)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 11434
-    if not is_port_open(host, port):
+    """Call Ollama for chat with optimized connection checking."""
+    if not is_port_open(OLLAMA_HOST, OLLAMA_PORT):
         print_err("Ollama not reachable; attempting to start server...")
         ensure_ollama_running()
 
@@ -394,6 +453,7 @@ def call_ollama_chat(message: str, model: str) -> str:
         return obj.get("message", {}).get("content", "").strip()
 
 def run_plan(task: str, model: str, auto: bool=False, dry_run: bool=False) -> int:
+    """Execute a multi-step plan with improved error handling."""
     payload = {
         "model": model,
         "messages": [
@@ -405,9 +465,14 @@ def run_plan(task: str, model: str, auto: bool=False, dry_run: bool=False) -> in
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(OLLAMA_URL.replace('/api/generate','/api/chat'), data=data, headers={"Content-Type":"application/json"})
-    with urllib.request.urlopen(req, timeout=180) as r:
-        obj = json.loads(r.read().decode("utf-8"))
-        content = obj.get("message", {}).get("content", "").strip()
+    
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            obj = json.loads(r.read().decode("utf-8"))
+            content = obj.get("message", {}).get("content", "").strip()
+    except urllib.error.URLError as e:
+        print_err("✗ Failed to reach Ollama for planning:", str(e))
+        return 1
 
     steps, notes = _parse_plan_from_response(content)
     if not steps:
@@ -447,6 +512,7 @@ def explain(cmd: str, model: str):
     print(explanation)
 
 def one_shot(args):
+    """Handle one-shot command execution with improved error handling."""
     model = DEFAULT_MODEL
     # Early help/version
     if any(a in ("-h", "--help") for a in args):
@@ -457,7 +523,8 @@ def one_shot(args):
     dry = False
     if "--model" in args:
         i = args.index("--model")
-        try: model = args[i+1]
+        try: 
+            model = args[i+1]
         except IndexError:
             print_err("Missing model name after --model"); sys.exit(2)
         args = args[:i] + args[i+2:]
@@ -475,7 +542,11 @@ def one_shot(args):
         text = " ".join(args).strip()
         if not text:
             print(HELP); sys.exit(0)
-        explain(text, model)
+        try:
+            explain(text, model)
+        except Exception as e:
+            print_err(f"✗ Error during explanation: {e}")
+            sys.exit(1)
         return
 
     if "--chat" in args:
@@ -485,10 +556,10 @@ def one_shot(args):
             print(HELP); sys.exit(0)
         try:
             reply = call_ollama_chat(text, model)
-        except Exception:
-            print_err("✗ Ollama unavailable; cannot chat without LLM.")
+            print(reply)
+        except Exception as e:
+            print_err(f"✗ Ollama unavailable; cannot chat without LLM. Error: {e}")
             sys.exit(1)
-        print(reply)
         return
 
     if "--plan" in args:
@@ -498,10 +569,10 @@ def one_shot(args):
             print(HELP); sys.exit(0)
         try:
             rc = run_plan(text, model, auto=auto, dry_run=dry)
-        except Exception:
-            print_err("✗ Ollama unavailable; planner requires the LLM.")
+            sys.exit(rc)
+        except Exception as e:
+            print_err(f"✗ Ollama unavailable; planner requires the LLM. Error: {e}")
             sys.exit(1)
-        sys.exit(rc)
 
     text = " ".join(args).strip()
     if not text:
@@ -517,15 +588,18 @@ def one_shot(args):
     except Exception:
         cmd = _fallback_command(text)
         print_err("ℹ︎ Ollama unavailable; using fallback command.")
+    
     if not cmd:
         print_err("✗ The model returned no command. Try rephrasing or switch models with --model.")
         sys.exit(1)
+    
     print(f"Proposed: {cmd}")
     if dry or not ask_yes_no("Run this?", default="y"):
         print("Skipped."); return
     sys.exit(run_command(cmd))
 
 def interactive():
+    """Run interactive mode with improved error handling."""
     print("Termi (local LLM copilot). Type natural language or a command. Type :help, :model, :quit.")
     model = DEFAULT_MODEL
     while True:
@@ -533,14 +607,17 @@ def interactive():
             s = input("termi> ").strip()
         except (EOFError, KeyboardInterrupt):
             print(); break
+        
         if not s:
             continue
+        
         if s in (":q", ":quit", ":exit"):
             break
         if s in (":h", ":help"):
             print(HELP); continue
         if s in (":v", ":version"):
             print(f"termi {__version__}"); continue
+        
         if s.startswith(":model"):
             parts = s.split(maxsplit=1)
             if len(parts)==2:
@@ -549,37 +626,43 @@ def interactive():
             else:
                 print(f"current model: {model}")
             continue
+        
         if s.startswith(":explain "):
-            explain(s[len(":explain "):].strip(), model); continue
+            try:
+                explain(s[len(":explain "):].strip(), model)
+            except Exception as e:
+                print_err(f"✗ Error during explanation: {e}")
+            continue
 
-        # New interactive chat & plan
+        # Interactive chat & plan
         if s.startswith(":chat "):
             msg = s[len(":chat "):].strip()
             try:
                 ans = call_ollama_chat(msg, model)
                 print(ans)
-            except Exception:
-                print_err("✗ Ollama unavailable; cannot chat.")
+            except Exception as e:
+                print_err(f"✗ Ollama unavailable; cannot chat. Error: {e}")
             continue
 
         if s.startswith(":plan "):
             task = s[len(":plan "):].strip()
             try:
                 run_plan(task, model, auto=False, dry_run=False)
-            except Exception:
-                print_err("✗ Ollama unavailable; planner requires the LLM.")
+            except Exception as e:
+                print_err(f"✗ Ollama unavailable; planner requires the LLM. Error: {e}")
             continue
 
         if s.startswith(":plan-auto "):
             task = s[len(":plan-auto "):].strip()
             try:
                 run_plan(task, model, auto=True, dry_run=False)
-            except Exception:
-                print_err("✗ Ollama unavailable; planner requires the LLM.")
+            except Exception as e:
+                print_err(f"✗ Ollama unavailable; planner requires the LLM. Error: {e}")
             continue
 
         if looks_like_command(s):
-            run_command(s); continue
+            run_command(s)
+            continue
 
         # NL → command (fallback only on Ollama unavailability)
         try:
@@ -590,11 +673,21 @@ def interactive():
         except Exception:
             cmd = _fallback_command(s)
             print_err("ℹ︎ Ollama unavailable; using fallback command.")
+        
         print(f"Proposed: {cmd}")
         if ask_yes_no("Run this?", default="y"):
             run_command(cmd)
 
 def main():
+    # Handle help/version before Ollama checks
+    if len(sys.argv) > 1:
+        if any(a in ("-h", "--help") for a in sys.argv[1:]):
+            print(HELP)
+            sys.exit(0)
+        if any(a in ("-v", "-V", "--version") for a in sys.argv[1:]):
+            print(f"termi {__version__}")
+            sys.exit(0)
+    
     ensure_ollama_installed()
     ensure_ollama_running()
     ensure_model_available(DEFAULT_MODEL)
