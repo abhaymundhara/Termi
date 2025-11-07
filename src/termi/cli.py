@@ -337,13 +337,13 @@ def _fallback_command(nl: str) -> str:
                 thresh = f"+{qty}G"
         return f"find . -type f -size {thresh} -print0 | xargs -0 ls -lh | sort -k5 -h | tail -n {top}"
     
-    # Disk usage
-    if ("disk" in s and "usage" in s) or ("space" in s and ("used" in s or "free" in s)):
-        return "du -sh * | sort -h"
-    
-    # Free space
-    if "free space" in s or ("how much space" in s):
+    # Free space (must check before disk usage to avoid false match)
+    if "free space" in s or "how much space" in s:
         return "df -h"
+    
+    # Disk usage
+    if ("disk" in s and "usage" in s) or ("space" in s and "used" in s):
+        return "du -sh * | sort -h"
     
     # Search text
     if ("search" in s or "find" in s) and ("text" in s or "string" in s or " for " in s):
