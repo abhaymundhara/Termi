@@ -164,10 +164,11 @@ def ensure_ollama_running() -> None:
             sys.exit(rc)
 
     # Wait for server with exponential backoff
+    # Using stepped exponential: increases every 3 iterations to balance responsiveness vs waiting
     for i in range(15):
         if is_port_open(OLLAMA_HOST, OLLAMA_PORT):
             return
-        time.sleep(min(0.2 * (2 ** (i // 3)), 2.0))  # Exponential backoff capped at 2s
+        time.sleep(min(0.2 * (2 ** (i // 3)), 2.0))  # Capped at 2s to avoid excessive delays
     print_err("✗ Ollama server did not become ready on", f"{OLLAMA_HOST}:{OLLAMA_PORT}")
     sys.exit(1)
 
@@ -543,7 +544,7 @@ def one_shot(args):
     dry = False
     if "--model" in args:
         i = args.index("--model")
-        try: 
+        try:
             model = args[i+1]
         except IndexError:
             print_err("Missing model name after --model"); sys.exit(2)
@@ -576,10 +577,10 @@ def one_shot(args):
             print(HELP); sys.exit(0)
         try:
             reply = call_ollama_chat(text, model)
-            print(reply)
         except Exception as e:
             print_err(f"✗ Ollama unavailable; cannot chat without LLM. Error: {e}")
             sys.exit(1)
+        print(reply)
         return
 
     if "--plan" in args:
@@ -589,10 +590,10 @@ def one_shot(args):
             print(HELP); sys.exit(0)
         try:
             rc = run_plan(text, model, auto=auto, dry_run=dry)
-            sys.exit(rc)
         except Exception as e:
             print_err(f"✗ Ollama unavailable; planner requires the LLM. Error: {e}")
             sys.exit(1)
+        sys.exit(rc)
 
     text = " ".join(args).strip()
     if not text:
