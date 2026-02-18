@@ -1,730 +1,797 @@
 #!/usr/bin/env python3
-import os
-import sys
+"""Termi CLI - Rich TUI terminal copilot.
+
+Complete rewrite with proper TUI, streaming, safety analysis,
+multi-backend LLM support, and persistent history.
+"""
 import json
+import os
 import shlex
 import shutil
 import subprocess
-import urllib.request
-import urllib.error
-import urllib.parse
-import time
-import platform
-import socket
-import re
+import sys
+from typing import Any, Dict, List, Optional
 
-try:
-    import importlib.metadata as _im
-    __version__ = _im.version("termi-copilot")
-except ImportError:
-    __version__ = "dev"
+import click
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
 
-# Default Ollama REST endpoint (we'll swap to /api/chat in requests)
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
-# Fast default model; override with --model or TERMI_MODEL
-DEFAULT_MODEL = os.environ.get("TERMI_MODEL", "gemma2:2b")
-SHELL = os.environ.get("SHELL", "/bin/zsh")
-
-# Cache parsed URL to avoid repeated parsing
-_PARSED_OLLAMA_URL = urllib.parse.urlparse(OLLAMA_URL)
-OLLAMA_HOST = _PARSED_OLLAMA_URL.hostname or "localhost"
-OLLAMA_PORT = _PARSED_OLLAMA_URL.port or 11434
-
-# Server polling configuration
-_POLL_INITIAL_DELAY = 0.2  # Initial delay in seconds
-_POLL_MAX_DELAY = 2.0      # Maximum delay between polls
-_POLL_BACKOFF_STEP = 3     # Increase delay every N iterations
-
-# --- Core prompts -------------------------------------------------------------------
-
-SYSTEM_PROMPT = """You are a terminal copilot. Convert the user's natural-language request into ONE safe, POSIX-compatible macOS (zsh) shell command.
-
-Output FORMAT (STRICT):
-- ALWAYS return a single-line JSON object.
-- For commands: {"cmd": "<the command>"}
-- For explanations: {"explanation": "<2-3 sentences>"}
-- No code fences, no backticks, no extra keys, no prose.
-
-Guidelines:
-- Prefer non-destructive commands unless the user clearly asks otherwise.
-- Use common tools (ls, grep, sed, awk, find, du, df, curl, git, python, node, etc.).
-- Assume current working directory is the user's project folder.
-- If ambiguous, choose a reasonable default and still return a command.
-
-Examples:
-User: list files
-Assistant: {"cmd": "ls -la"}
-
-User: show largest files
-Assistant: {"cmd": "find . -type f -size +100M -print0 | xargs -0 ls -lh | sort -k5 -h | tail -n 20"}
-
-User: explain `find . -type f -size +100M`
-Assistant: {"explanation": "Searches the current directory for regular files larger than 100 MB and lists them."}
-"""
-
-# For general chat answers
-CHAT_PROMPT = (
-    "You are a concise, helpful terminal copilot. Answer the user's question plainly. "
-    "If they ask about commands, include a short example, otherwise just answer."
+from . import __version__
+from .config import load_config, write_default_config, get_system_info
+from .context import build_context
+from .fallback import fallback_command
+from .history import Bookmarks, History
+from .llm import (
+    call_llm,
+    ensure_model_available,
+    ensure_ollama_installed,
+    ensure_ollama_running,
+    generate_chat,
+    generate_command,
+    generate_explanation,
+    generate_plan,
+    list_ollama_models,
+    stream_chat,
+    stream_llm,
+    build_system_prompt,
 )
+from .safety import RiskLevel, analyze_command, risk_color
+from .themes import get_theme
 
-# For planner (multi-step)
-PLAN_PROMPT = (
-    "You are a terminal copilot that plans and executes tasks using shell commands. "
-    "Given a high-level task, produce a short JSON plan with steps. Each step must have a 'thought' and a 'cmd'. "
-    "Output STRICT JSON on one line: {\"plan\": [{\"thought\": str, \"cmd\": str}, ...], \"notes\": str}. No code fences."
-)
+# ---------------------------------------------------------------------------
+# Console setup
+# ---------------------------------------------------------------------------
 
-# --- Help banner --------------------------------------------------------------------
+console: Optional[Console] = None
 
-HELP = f"""\
-Termi — Your local terminal copilot
 
-Usage:
-  termi                      # interactive mode
-  termi "text here"          # one-shot: NL → command → confirm → run
-  termi --chat "message"     # general chat/answer (no command)
-  termi --plan "task"        # multi-step plan → confirm each → run
-  termi --auto --plan "task" # auto-run a planned sequence (no prompts)
-  termi --explain "cmd"      # explain a command without running it
-  termi --dry-run "..."      # NL → command (show only, don't run)
-  termi --model <name>       # override model (default: {DEFAULT_MODEL})
+def _get_console(cfg: Dict[str, Any]) -> Console:
+    global console
+    if console is None:
+        theme = get_theme(cfg.get("theme", "monokai"))
+        console = Console(theme=theme)
+    return console
 
-Notes:
-  • On first run, Termi checks for Ollama and offers to install/start it for you.
-  • If the default model is missing, Termi offers to pull it.
-  • Use --chat for general questions; use --plan for multi-step tasks with reasoning.
 
-Env:
-  OLLAMA_URL=http://localhost:11434/api/generate
-  TERMI_MODEL={DEFAULT_MODEL}
-"""
+# ---------------------------------------------------------------------------
+# Parse helpers
+# ---------------------------------------------------------------------------
 
-def print_err(*a): print(*a, file=sys.stderr)
-
-# --- Network / environment helpers --------------------------------------------------
-
-def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
-    """Check if a port is open with proper error handling."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect((host, port))
-            return True
-    except (OSError, socket.error):
-        return False
-
-def prompt_install_ollama() -> bool:
-    print("Ollama is not installed.")
-    return ask_yes_no("Install Ollama now? This may require sudo.", default="y")
-
-def install_ollama() -> int:
-    system = platform.system()
-    if system == "Darwin" and shutil.which("brew"):
-        cmd = "brew install ollama"
-    else:
-        cmd = "curl -fsSL https://ollama.com/install.sh | sh"
-    print(f"Installing via: {cmd}")
-    return run_command(cmd)
-
-def run_in_new_terminal_mac(command: str) -> int:
-    """Open a new macOS Terminal window running the given command."""
-    # Use proper escaping for AppleScript
-    escaped_cmd = command.replace('\\', '\\\\').replace('"', '\\"')
-    osa = (
-        'osascript -e '
-        '"tell application \\"Terminal\\" to do script \\"' + escaped_cmd + '\\""'
-    )
-    return run_command(osa)
-
-def ensure_ollama_installed() -> None:
-    if shutil.which("ollama"):
-        return
-    if not prompt_install_ollama():
-        print_err("✗ Ollama not installed. Termi needs Ollama to work. Exiting.")
-        sys.exit(1)
-    rc = install_ollama()
-    if rc != 0:
-        print_err("✗ Ollama installation failed (exit code", rc, ")")
-        sys.exit(rc)
-
-def ensure_ollama_running() -> None:
-    if is_port_open(OLLAMA_HOST, OLLAMA_PORT):
-        return
-
-    print("Ollama server not detected on", f"{OLLAMA_HOST}:{OLLAMA_PORT}")
-    if not ask_yes_no("Start Ollama server in a new Terminal window?", default="y"):
-        print_err("✗ Ollama server not running. Exiting.")
-        sys.exit(1)
-
-    if platform.system() == "Darwin":
-        rc = run_in_new_terminal_mac(f"/bin/zsh -lc 'ollama serve'")
-        if rc != 0:
-            print_err("✗ Failed to spawn ollama serve (osascript exit", rc, ")")
-            sys.exit(rc)
-    else:
-        rc = run_command("nohup ollama serve >/dev/null 2>&1 &")
-        if rc != 0:
-            print_err("✗ Failed to start ollama serve (exit", rc, ")")
-            sys.exit(rc)
-
-    # Wait for server with exponential backoff
-    # Using stepped exponential: increases every N iterations to balance responsiveness vs waiting
-    for i in range(15):
-        if is_port_open(OLLAMA_HOST, OLLAMA_PORT):
-            return
-        delay = min(_POLL_INITIAL_DELAY * (2 ** (i // _POLL_BACKOFF_STEP)), _POLL_MAX_DELAY)
-        time.sleep(delay)
-    print_err("✗ Ollama server did not become ready on", f"{OLLAMA_HOST}:{OLLAMA_PORT}")
-    sys.exit(1)
-
-def ensure_model_available(model: str) -> None:
-    """Check if model is available, with improved error handling."""
-    if not shutil.which("ollama"):
-        return
-    try:
-        out = subprocess.check_output(["ollama", "list"], text=True, stderr=subprocess.PIPE)
-        if model in out:
-            return
-    except (subprocess.CalledProcessError, OSError) as e:
-        # If ollama list fails, log for debugging but continue
-        print_err(f"Note: Could not verify model availability: {e}")
-        pass
-    
-    print(f"Model '{model}' not found locally.")
-    if ask_yes_no(f"Pull '{model}' now?", default="y"):
-        rc = run_command(f"ollama pull {shlex.quote(model)}")
-        if rc != 0:
-            print_err("✗ Failed to pull model", model, "(exit", rc, ")")
-    else:
-        print_err("Skipping model pull; generation may fail if the model is missing.")
-
-# --- Parsing helpers ----------------------------------------------------------------
-
-def _parse_cmd_from_response(text: str) -> str:
-    """Parse command from LLM response, handling JSON and fallback to plain text."""
+def _parse_json_field(text: str, field: str) -> str:
+    """Extract a field from JSON response, with fallback to raw text."""
     t = text.strip()
-    if not t:
-        return ""
-    
-    # Remove backticks if present
-    if t.startswith('`'):
-        t = t.strip('`')
-    
+    if t.startswith("`"):
+        t = t.strip("`")
+    if t.startswith("```"):
+        lines = t.splitlines()
+        t = "\n".join(lines[1:-1] if len(lines) > 2 else lines)
     try:
         obj = json.loads(t)
-        if isinstance(obj, dict) and "cmd" in obj and isinstance(obj["cmd"], str):
-            return obj["cmd"].strip()
+        if isinstance(obj, dict) and field in obj:
+            return str(obj[field]).strip()
     except (json.JSONDecodeError, ValueError):
         pass
-    
     # Fallback: return first non-empty line
     for line in t.splitlines():
         line = line.strip()
-        if line:
+        if line and not line.startswith("{"):
             return line
-    return ""
-
-def _parse_explanation_from_response(text: str) -> str:
-    """Parse explanation from LLM response, handling JSON and fallback to plain text."""
-    t = text.strip()
-    if not t:
-        return ""
-    
-    # Remove backticks if present
-    if t.startswith('`'):
-        t = t.strip('`')
-    
-    try:
-        obj = json.loads(t)
-        if isinstance(obj, dict) and "explanation" in obj and isinstance(obj["explanation"], str):
-            return obj["explanation"].strip()
-    except (json.JSONDecodeError, ValueError):
-        pass
-    
     return t
 
-def _parse_plan_from_response(text: str):
-    """Parse plan from LLM response with improved error handling."""
-    t = text.strip()
-    if not t:
-        return [], ""
-    
-    # Remove backticks if present
-    if t.startswith('`'):
-        t = t.strip('`')
-    
+
+def _parse_cmd(text: str) -> str:
+    return _parse_json_field(text, "cmd")
+
+
+def _parse_explanation(text: str) -> str:
+    return _parse_json_field(text, "explanation")
+
+
+# ---------------------------------------------------------------------------
+# Shell helpers
+# ---------------------------------------------------------------------------
+
+def _run_command(cmd: str, shell: str) -> int:
+    if not cmd or not cmd.strip():
+        return 1
     try:
-        obj = json.loads(t)
-        if isinstance(obj, dict) and "plan" in obj and isinstance(obj["plan"], list):
-            steps = []
-            for it in obj["plan"]:
-                if isinstance(it, dict) and "cmd" in it:
-                    steps.append({
-                        "thought": str(it.get("thought", "")).strip(),
-                        "cmd": str(it.get("cmd", "")).strip(),
-                    })
-            notes = str(obj.get("notes", "")).strip()
-            return steps, notes
-    except (json.JSONDecodeError, ValueError):
-        pass
-    
-    return [], ""
+        p = subprocess.run(cmd, shell=True, executable=shell)
+        return p.returncode
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        return 1
 
-# --- Simple shell helpers ------------------------------------------------------------
 
-def which_exists(token: str) -> bool:
-    return shutil.which(token) is not None
-
-def looks_like_command(s: str) -> bool:
-    """Check if string looks like a valid command with improved validation."""
+def _looks_like_command(s: str) -> bool:
     if not s or not s.strip():
         return False
-    
     try:
         parts = shlex.split(s)
     except ValueError:
         return False
-    
-    return len(parts) > 0 and which_exists(parts[0])
+    return len(parts) > 0 and shutil.which(parts[0]) is not None
 
-def run_command(cmd: str) -> int:
-    """Execute a shell command with proper error handling."""
-    if not cmd or not cmd.strip():
-        print_err("✗ Empty command, nothing to run.")
-        return 1
-    
-    try:
-        p = subprocess.run(cmd, shell=True, executable=SHELL)
-        return p.returncode
-    except KeyboardInterrupt:
-        return 130
-    except Exception as e:
-        print_err(f"✗ Error executing command: {e}")
-        return 1
 
-def ask_yes_no(prompt: str, default="n") -> bool:
-    """Ask user for yes/no confirmation with proper error handling."""
-    prompt_full = f"{prompt} [{'Y/n' if default=='y' else 'y/N'}]: "
+def _copy_to_clipboard(text: str, con: Console) -> None:
     try:
-        ans = input(prompt_full).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
+        import pyperclip
+        pyperclip.copy(text)
+        con.print("[termi.success]Copied to clipboard[/]")
+    except Exception:
+        con.print("[termi.muted]Could not copy to clipboard[/]")
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+def _show_command(cmd: str, con: Console) -> None:
+    """Display a proposed command with syntax highlighting."""
+    syntax = Syntax(cmd, "bash", theme="monokai", word_wrap=True)
+    con.print(Panel(syntax, title="Proposed Command", border_style="cyan", expand=False))
+
+
+def _show_safety(cmd: str, con: Console, cfg: Dict[str, Any]) -> bool:
+    """Analyze and show safety warnings. Returns True if safe to proceed."""
+    if not cfg.get("safety_confirm", True):
+        return True
+    result = analyze_command(cmd)
+    if result.level == RiskLevel.SAFE:
+        return True
+    color = risk_color(result.level)
+    con.print(f"\n[{color}]{result.level.value.upper()} RISK[/]")
+    for reason in result.reasons:
+        con.print(f"  {reason}")
+    if result.suggestion:
+        con.print(f"[termi.info]{result.suggestion}[/]")
+    if result.level == RiskLevel.CRITICAL:
+        con.print("[bold red]This command is blocked. Override with --no-safety.[/]")
         return False
-    
+    return True
+
+
+def _confirm(prompt: str, con: Console, default: bool = True) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        ans = con.input(f"[termi.prompt]{prompt} {suffix}: [/]").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        con.print()
+        return False
     if not ans:
-        ans = default
+        return default
     return ans in ("y", "yes")
 
-# --- Heuristic fallback (only when Ollama is unavailable) ----------------------------
 
-# Pre-compiled regex patterns for efficiency
-_RE_TOP_N = re.compile(r"top\s+(\d+)")
-_RE_SIZE_PATTERN = re.compile(r"(\d+)\s*(m|mb|g|gb)\b")
-_RE_QUOTED_TEXT = re.compile(r'"([^"]+)"|\'([^\']+)\'')
-_RE_FILE_EXT = re.compile(r'\.(\w+)$')
-_RE_NAME_PATTERN = re.compile(r'name\s+([\w\-\.]+)')
-
-def _fallback_command(nl: str) -> str:
-    """Generate fallback command based on heuristics when LLM is unavailable."""
-    s = nl.strip().lower()
-    
-    # Large files first
-    if ("large" in s or "largest" in s or "big" in s or "biggest" in s or "huge" in s) and ("file" in s or "files" in s):
-        m = _RE_TOP_N.search(s)
-        top = int(m.group(1)) if m else 20
-        
-        thresh = "+100M"
-        m2 = _RE_SIZE_PATTERN.search(s)
-        if m2:
-            qty, unit = m2.groups()
-            unit = unit.lower()
-            if unit in ("m", "mb"):
-                thresh = f"+{qty}M"
-            elif unit in ("g", "gb"):
-                thresh = f"+{qty}G"
-        return f"find . -type f -size {thresh} -print0 | xargs -0 ls -lh | sort -k5 -h | tail -n {top}"
-    
-    # Free space (must check before disk usage to avoid false match)
-    if "free space" in s or "how much space" in s:
-        return "df -h"
-    
-    # Disk usage
-    if ("disk" in s and "usage" in s) or ("space" in s and "used" in s):
-        return "du -sh * | sort -h"
-    
-    # Search text
-    if ("search" in s or "find" in s) and ("text" in s or "string" in s or " for " in s):
-        m = _RE_QUOTED_TEXT.search(nl)
-        term = m.group(1) if m and m.group(1) is not None else (m.group(2) if m else None)
-        if term:
-            return f"grep -RIn {shlex.quote(term)} ."
-        return "grep -RIn ."
-    
-    # Find by extension/name
-    if "find" in s and ("file" in s or "files" in s or "name" in s or s.strip().endswith(('.py', '.js', '.txt'))):
-        m = _RE_FILE_EXT.search(s)
-        if m:
-            ext = m.group(1)
-            return f"find . -type f -iname '*.{ext}'"
-        
-        m = _RE_NAME_PATTERN.search(s)
-        if m:
-            pattern = m.group(1)
-            return f"find . -type f -iname {shlex.quote(pattern)}"
-        return "find . -type f -maxdepth 3 -print"
-    
-    # Processes
-    if "process" in s or "processes" in s or "running apps" in s:
-        return "ps aux | less"
-    
-    # Ports
-    if "open ports" in s or ("ports" in s and "listen" in s):
-        return "lsof -i -P | grep LISTEN"
-    
-    # IP address
-    if "ip address" in s or "my ip" in s:
-        return "ipconfig getifaddr en0 || ipconfig getifaddr en1 || hostname -I"
-    
-    # System info
-    if "system info" in s or "os version" in s:
-        return "sw_vers && uname -a"
-    
-    # Git basics
-    if s.startswith("git status") or "git status" in s:
-        return "git status"
-    if "pull" in s and "git" in s:
-        return "git pull --ff-only"
-    if "show branches" in s or ("git" in s and "branch" in s):
-        return "git branch -vv"
-    
-    # Generic list (default)
-    if ("list" in s or "show" in s) and ("files" in s or "dir" in s or "directory" in s or "here" in s or "current" in s):
-        return "ls -la"
-    
-    return "ls -la"
-
-# --- LLM calls ----------------------------------------------------------------------
-
-def call_ollama(prompt: str, model: str, explain: bool=False) -> str:
-    """Call Ollama API with improved error handling and caching."""
-    # Ensure server reachable; start if needed
-    if not is_port_open(OLLAMA_HOST, OLLAMA_PORT):
-        print_err("Ollama not reachable; attempting to start server...")
-        ensure_ollama_running()
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt.strip()},
-    ]
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "options": {
-            "temperature": 0.1,
-            "top_p": 0.9,
-            "repeat_penalty": 1.05,
-            "num_ctx": 2048,
-            "num_predict": 64,
-            "seed": 7,
-        },
-    }
-
-    def _do_request(payload):
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            OLLAMA_URL.replace('/api/generate','/api/chat'),
-            data=data,
-            headers={"Content-Type":"application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=120) as r:
-            obj = json.loads(r.read().decode("utf-8"))
-            return obj.get("message", {}).get("content", "").strip()
-
+def _stream_response(messages: List[Dict], model: str, cfg: Dict[str, Any], con: Console) -> str:
+    """Stream LLM response with live display."""
+    full_text = ""
     try:
-        resp = _do_request(payload)
-        text = _parse_explanation_from_response(resp) if explain else _parse_cmd_from_response(resp)
-        if text:
-            return text
-        # Retry with a stronger instruction if empty
-        payload_retry = dict(payload)
-        payload_retry["messages"] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": (prompt.strip() + "\n\nReturn JSON only.")},
-        ]
-        resp2 = _do_request(payload_retry)
-        return _parse_explanation_from_response(resp2) if explain else _parse_cmd_from_response(resp2)
-    except urllib.error.URLError as e:
-        print_err("✗ Could not reach Ollama at", OLLAMA_URL)
-        print_err("  Make sure Ollama is running: `ollama serve` and you pulled the model:", model)
-        raise e
+        with Live("", console=con, refresh_per_second=15) as live:
+            for token in stream_llm(messages, model, cfg):
+                full_text += token
+                live.update(Text(full_text))
+    except Exception:
+        # Fallback to non-streaming
+        full_text = call_llm(messages, model, cfg)
+        con.print(full_text)
+    return full_text
 
-def call_ollama_chat(message: str, model: str) -> str:
-    """Call Ollama for chat with optimized connection checking."""
-    if not is_port_open(OLLAMA_HOST, OLLAMA_PORT):
-        print_err("Ollama not reachable; attempting to start server...")
-        ensure_ollama_running()
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": CHAT_PROMPT},
-            {"role": "user", "content": message.strip()},
-        ],
-        "stream": False,
-        "options": {"temperature": 0.3, "num_predict": 256},
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(OLLAMA_URL.replace('/api/generate','/api/chat'), data=data, headers={"Content-Type":"application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        obj = json.loads(r.read().decode("utf-8"))
-        return obj.get("message", {}).get("content", "").strip()
+# ---------------------------------------------------------------------------
+# Core flows
+# ---------------------------------------------------------------------------
 
-def run_plan(task: str, model: str, auto: bool=False, dry_run: bool=False) -> int:
-    """Execute a multi-step plan with improved error handling."""
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": PLAN_PROMPT},
-            {"role": "user", "content": task.strip()},
-        ],
-        "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 256},
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(OLLAMA_URL.replace('/api/generate','/api/chat'), data=data, headers={"Content-Type":"application/json"})
-    
-    try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            obj = json.loads(r.read().decode("utf-8"))
-            content = obj.get("message", {}).get("content", "").strip()
-    except urllib.error.URLError as e:
-        print_err("✗ Failed to reach Ollama for planning:", str(e))
+def _do_explain(text: str, model: str, cfg: Dict[str, Any], con: Console) -> None:
+    with con.status("[termi.muted]Thinking...[/]"):
+        explanation = generate_explanation(text, model, cfg)
+    parsed = _parse_explanation(explanation)
+    con.print(Panel(parsed, title="Explanation", border_style="cyan", expand=False))
+
+
+def _do_oneshot(text: str, model: str, cfg: Dict[str, Any], con: Console,
+                history: History, dry: bool = False) -> int:
+    """NL -> command -> confirm -> run."""
+    context = build_context(cfg.get("context_lines", 50))
+
+    with con.status("[termi.muted]Generating command...[/]"):
+        try:
+            raw = generate_command(text, model, cfg, context=context)
+        except Exception:
+            raw = ""
+
+    cmd = _parse_cmd(raw) if raw else ""
+
+    if not cmd:
+        # Fallback to heuristic
+        cmd = fallback_command(text)
+        con.print("[termi.warning]LLM unavailable, using heuristic fallback[/]")
+
+    _show_command(cmd, con)
+
+    if not _show_safety(cmd, con, cfg):
         return 1
 
-    steps, notes = _parse_plan_from_response(content)
+    if cfg.get("clipboard_auto"):
+        _copy_to_clipboard(cmd, con)
+
+    if dry:
+        con.print("[termi.muted](dry-run, not executing)[/]")
+        history.add(text, cmd, mode="dry-run", model=model, cwd=os.getcwd())
+        return 0
+
+    if not _confirm("Run this?", con):
+        con.print("[termi.muted]Skipped[/]")
+        return 0
+
+    rc = _run_command(cmd, cfg.get("shell", "/bin/bash"))
+    history.add(text, cmd, mode="oneshot", model=model, exit_code=rc, cwd=os.getcwd())
+
+    if rc == 0:
+        con.print(f"[termi.success]Done (exit 0)[/]")
+    else:
+        con.print(f"[termi.error]Exit code: {rc}[/]")
+    return rc
+
+
+def _do_plan(task: str, model: str, cfg: Dict[str, Any], con: Console,
+             history: History, auto: bool = False, dry: bool = False) -> int:
+    with con.status("[termi.muted]Planning...[/]"):
+        steps, notes = generate_plan(task, model, cfg)
+
     if not steps:
-        print_err("✗ Planner returned no steps. Try rephrasing or a bigger model.")
+        con.print("[termi.error]Planner returned no steps. Try rephrasing or a bigger model.[/]")
         return 1
 
-    print("Plan:")
+    table = Table(title="Execution Plan", border_style="cyan")
+    table.add_column("#", style="termi.step", width=3)
+    table.add_column("Thought", style="termi.thought")
+    table.add_column("Command", style="termi.command")
     for i, st in enumerate(steps, 1):
-        print(f"  {i}. {st['thought'] or '(step)'}\n     → {st['cmd']}")
+        table.add_row(str(i), st["thought"] or "-", st["cmd"])
+    con.print(table)
     if notes:
-        print(f"Notes: {notes}")
+        con.print(f"[termi.info]Notes: {notes}[/]")
 
     rc_final = 0
     for i, st in enumerate(steps, 1):
         cmd = st["cmd"]
         if not cmd:
             continue
-        if dry_run:
-            print(f"[dry-run] step {i}: {cmd}")
+        if dry:
+            con.print(f"[termi.muted][dry-run] step {i}: {cmd}[/]")
+            continue
+        if not _show_safety(cmd, con, cfg):
             continue
         if not auto:
-            if not ask_yes_no(f"Run step {i}? {cmd}", default="y"):
-                print("Skipped.")
+            if not _confirm(f"Run step {i}? {cmd}", con):
+                con.print("[termi.muted]Skipped[/]")
                 continue
-        print(f"\n▶ step {i}: {cmd}")
-        rc = run_command(cmd)
+        con.print(f"\n[termi.step]Step {i}:[/] {cmd}")
+        rc = _run_command(cmd, cfg.get("shell", "/bin/bash"))
+        history.add(task, cmd, mode="plan", model=model, exit_code=rc, cwd=os.getcwd())
         rc_final = rc if rc != 0 else rc_final
-        if rc != 0 and not ask_yes_no("A step failed. Continue?", default="n"):
-            break
+        if rc != 0:
+            con.print(f"[termi.error]Step {i} failed (exit {rc})[/]")
+            if not auto and not _confirm("Continue?", con, default=False):
+                break
     return rc_final
 
-# --- Core flows ---------------------------------------------------------------------
 
-def explain(cmd: str, model: str):
-    prompt = f"Explain this command clearly and concisely:\n\n{cmd}\n\n(Per rules: return only a short explanation, no command.)"
-    explanation = call_ollama(prompt, model, explain=True)
-    print(explanation)
+def _do_chat(message: str, model: str, cfg: Dict[str, Any], con: Console,
+             chat_history: List[Dict]) -> None:
+    if cfg.get("stream", True):
+        full = ""
+        try:
+            with Live("", console=con, refresh_per_second=15) as live:
+                for token in stream_chat(message, model, cfg, history=chat_history):
+                    full += token
+                    live.update(Markdown(full))
+        except Exception:
+            full = generate_chat(message, model, cfg, history=chat_history)
+            con.print(Markdown(full))
+    else:
+        with con.status("[termi.muted]Thinking...[/]"):
+            full = generate_chat(message, model, cfg, history=chat_history)
+        con.print(Markdown(full))
 
-def one_shot(args):
-    """Handle one-shot command execution with improved error handling."""
-    model = DEFAULT_MODEL
-    # Early help/version
-    if any(a in ("-h", "--help") for a in args):
-        print(HELP); sys.exit(0)
-    if any(a in ("-v", "-V", "--version") for a in args):
-        print(f"termi {__version__}"); sys.exit(0)
+    chat_history.append({"role": "user", "content": message})
+    chat_history.append({"role": "assistant", "content": full})
+    # Keep history bounded
+    if len(chat_history) > 20:
+        chat_history[:] = chat_history[-20:]
 
-    dry = False
+
+# ---------------------------------------------------------------------------
+# Interactive mode
+# ---------------------------------------------------------------------------
+
+def _interactive_completer():
+    """Build prompt_toolkit completer for interactive mode."""
+    try:
+        from prompt_toolkit.completion import WordCompleter
+        words = [
+            ":help", ":quit", ":exit", ":model", ":explain",
+            ":chat", ":plan", ":plan-auto", ":history", ":clear",
+            ":bookmark", ":bookmarks", ":unbookmark", ":copy",
+            ":context", ":config", ":models", ":theme", ":version",
+            ":safety",
+        ]
+        return WordCompleter(words, sentence=True)
+    except ImportError:
+        return None
+
+
+def _interactive(cfg: Dict[str, Any]) -> None:
+    model = cfg.get("model", "gemma2:2b")
+    con = _get_console(cfg)
+    history = History(limit=cfg.get("history_limit", 500))
+    bookmarks = Bookmarks()
+    chat_history: List[Dict] = []
+
+    # Welcome banner
+    banner = Text()
+    banner.append("Termi", style="bold cyan")
+    banner.append(f" v{__version__}", style="dim")
+    banner.append(" | local LLM copilot\n", style="dim")
+    banner.append(f"Model: {model}", style="termi.info")
+    banner.append(" | Type ", style="dim")
+    banner.append(":help", style="termi.command")
+    banner.append(" for commands", style="dim")
+    con.print(Panel(banner, border_style="cyan", expand=False))
+
+    # Try prompt_toolkit for better UX
+    use_pt = False
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.history import FileHistory
+        from .config import CONFIG_DIR
+        pt_history = FileHistory(str(CONFIG_DIR / "prompt_history"))
+        session = PromptSession(
+            history=pt_history,
+            completer=_interactive_completer(),
+            enable_history_search=True,
+        )
+        use_pt = True
+    except ImportError:
+        session = None
+
+    while True:
+        try:
+            if use_pt and session:
+                s = session.prompt("termi> ").strip()
+            else:
+                s = input("termi> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            con.print()
+            break
+
+        if not s:
+            continue
+
+        # Meta commands
+        if s in (":q", ":quit", ":exit"):
+            break
+
+        if s in (":h", ":help"):
+            _show_help(con)
+            continue
+
+        if s in (":v", ":version"):
+            con.print(f"termi {__version__}")
+            continue
+
+        if s.startswith(":model"):
+            parts = s.split(maxsplit=1)
+            if len(parts) == 2:
+                model = parts[1].strip()
+                con.print(f"[termi.success]Model set to {model}[/]")
+            else:
+                con.print(f"Current model: [termi.command]{model}[/]")
+            continue
+
+        if s == ":models":
+            models = list_ollama_models()
+            if models:
+                for m in models:
+                    marker = " *" if m == model else ""
+                    con.print(f"  [termi.command]{m}[/]{marker}")
+            else:
+                con.print("[termi.muted]No models found (is Ollama running?)[/]")
+            continue
+
+        if s.startswith(":theme"):
+            parts = s.split(maxsplit=1)
+            if len(parts) == 2:
+                cfg["theme"] = parts[1].strip()
+                global console
+                console = None
+                con = _get_console(cfg)
+                con.print(f"[termi.success]Theme set to {cfg['theme']}[/]")
+            else:
+                con.print(f"Current theme: {cfg.get('theme', 'monokai')}")
+                con.print("Available: monokai, dracula, minimal")
+            continue
+
+        if s == ":safety":
+            current = cfg.get("safety_confirm", True)
+            cfg["safety_confirm"] = not current
+            state = "ON" if cfg["safety_confirm"] else "OFF"
+            con.print(f"[termi.info]Safety checks: {state}[/]")
+            continue
+
+        if s.startswith(":explain "):
+            _do_explain(s[len(":explain "):].strip(), model, cfg, con)
+            continue
+
+        if s.startswith(":chat "):
+            _do_chat(s[len(":chat "):].strip(), model, cfg, con, chat_history)
+            continue
+
+        if s.startswith(":plan-auto "):
+            task = s[len(":plan-auto "):].strip()
+            _do_plan(task, model, cfg, con, history, auto=True)
+            continue
+
+        if s.startswith(":plan "):
+            task = s[len(":plan "):].strip()
+            _do_plan(task, model, cfg, con, history)
+            continue
+
+        if s == ":history":
+            entries = history.recent(20)
+            if not entries:
+                con.print("[termi.muted]No history yet[/]")
+            else:
+                table = Table(title="Recent Commands", border_style="dim")
+                table.add_column("Query", style="dim", max_width=40)
+                table.add_column("Command", style="termi.command")
+                table.add_column("Exit", width=4)
+                for e in entries:
+                    exit_str = str(e.exit_code) if e.exit_code is not None else "-"
+                    table.add_row(e.query[:40], e.command, exit_str)
+                con.print(table)
+            continue
+
+        if s.startswith(":history "):
+            query = s[len(":history "):].strip()
+            entries = history.search(query)
+            if not entries:
+                con.print(f"[termi.muted]No matches for '{query}'[/]")
+            else:
+                for e in entries[:10]:
+                    con.print(f"  [termi.command]{e.command}[/] [dim]({e.query})[/]")
+            continue
+
+        if s == ":clear":
+            history.clear()
+            con.print("[termi.success]History cleared[/]")
+            continue
+
+        if s.startswith(":bookmark "):
+            parts = s[len(":bookmark "):].strip().split(maxsplit=1)
+            if len(parts) >= 1:
+                name = parts[0]
+                cmd = parts[1] if len(parts) > 1 else ""
+                if not cmd and history.entries:
+                    cmd = history.entries[-1].command
+                bookmarks.add(name, cmd)
+                con.print(f"[termi.success]Bookmarked '{name}': {cmd}[/]")
+            continue
+
+        if s == ":bookmarks":
+            bms = bookmarks.list_all()
+            if not bms:
+                con.print("[termi.muted]No bookmarks[/]")
+            else:
+                for name, info in bms.items():
+                    con.print(f"  [termi.highlight]{name}[/]: [termi.command]{info['command']}[/]")
+            continue
+
+        if s.startswith(":unbookmark "):
+            name = s[len(":unbookmark "):].strip()
+            if bookmarks.remove(name):
+                con.print(f"[termi.success]Removed bookmark '{name}'[/]")
+            else:
+                con.print(f"[termi.muted]Bookmark '{name}' not found[/]")
+            continue
+
+        if s.startswith(":copy"):
+            if history.entries:
+                _copy_to_clipboard(history.entries[-1].command, con)
+            else:
+                con.print("[termi.muted]No command to copy[/]")
+            continue
+
+        if s == ":context":
+            ctx = build_context(cfg.get("context_lines", 50))
+            con.print(Panel(ctx, title="Current Context", border_style="dim"))
+            continue
+
+        if s == ":config":
+            info = get_system_info()
+            table = Table(title="Configuration", border_style="dim")
+            table.add_column("Key", style="termi.highlight")
+            table.add_column("Value")
+            for k, v in cfg.items():
+                table.add_row(k, str(v))
+            table.add_row("---", "---")
+            for k, v in info.items():
+                table.add_row(f"sys.{k}", v)
+            con.print(table)
+            continue
+
+        # Check if it's a bookmarked command
+        bm = bookmarks.get(s.lstrip(":"))
+        if bm:
+            cmd = bm["command"]
+            _show_command(cmd, con)
+            if _show_safety(cmd, con, cfg) and _confirm("Run this?", con):
+                rc = _run_command(cmd, cfg.get("shell", "/bin/bash"))
+                history.add(s, cmd, mode="bookmark", model=model, exit_code=rc, cwd=os.getcwd())
+            continue
+
+        # Direct command
+        if _looks_like_command(s):
+            if _show_safety(s, con, cfg):
+                rc = _run_command(s, cfg.get("shell", "/bin/bash"))
+                history.add(s, s, mode="direct", exit_code=rc, cwd=os.getcwd())
+            continue
+
+        # NL -> command
+        _do_oneshot(s, model, cfg, con, history)
+
+
+def _show_help(con: Console) -> None:
+    help_text = """
+[bold cyan]Termi Commands[/]
+
+[termi.command]:help[/]              Show this help
+[termi.command]:quit[/]              Exit interactive mode
+[termi.command]:model <name>[/]      Switch LLM model
+[termi.command]:models[/]            List available models
+[termi.command]:theme <name>[/]      Switch theme (monokai, dracula, minimal)
+[termi.command]:explain <cmd>[/]     Explain a command
+[termi.command]:chat <msg>[/]        General chat (multi-turn)
+[termi.command]:plan <task>[/]       Multi-step plan with confirmation
+[termi.command]:plan-auto <task>[/]  Auto-run a planned sequence
+[termi.command]:history[/]           Show recent commands
+[termi.command]:history <query>[/]   Search history
+[termi.command]:clear[/]             Clear history
+[termi.command]:bookmark <n> <cmd>[/] Bookmark a command
+[termi.command]:bookmarks[/]         List bookmarks
+[termi.command]:unbookmark <n>[/]    Remove bookmark
+[termi.command]:copy[/]              Copy last command to clipboard
+[termi.command]:context[/]           Show current context (cwd, git, etc.)
+[termi.command]:config[/]            Show configuration
+[termi.command]:safety[/]            Toggle safety checks
+[termi.command]:version[/]           Show version
+
+[dim]Or just type natural language to get a command, or type a command to run it directly.[/]
+"""
+    con.print(Panel(help_text.strip(), title="Help", border_style="cyan", expand=False))
+
+
+# ---------------------------------------------------------------------------
+# Shell completion generator
+# ---------------------------------------------------------------------------
+
+def _generate_completions(shell: str) -> str:
+    if shell == "bash":
+        return """# Termi bash completion
+_termi_complete() {
+    local cur=${COMP_WORDS[COMP_CWORD]}
+    COMPREPLY=($(compgen -W "--help --version --explain --chat --plan --auto --dry-run --model --no-safety --stream --no-stream --list-models --init-config --completions" -- "$cur"))
+}
+complete -F _termi_complete termi"""
+    elif shell == "zsh":
+        return """# Termi zsh completion
+_termi() {
+    _arguments \\
+        '--help[Show help]' \\
+        '--version[Show version]' \\
+        '--explain[Explain a command]' \\
+        '--chat[General chat]' \\
+        '--plan[Multi-step plan]' \\
+        '--auto[Auto-run plan]' \\
+        '--dry-run[Show command only]' \\
+        '--model[Override model]:model:' \\
+        '--no-safety[Disable safety]' \\
+        '--stream[Enable streaming]' \\
+        '--no-stream[Disable streaming]' \\
+        '--list-models[List models]' \\
+        '--init-config[Create config]' \\
+        '--completions[Generate completions]:shell:(bash zsh fish)' \\
+        '*:query:'
+}
+compdef _termi termi"""
+    elif shell == "fish":
+        return """# Termi fish completion
+complete -c termi -l help -d 'Show help'
+complete -c termi -l version -d 'Show version'
+complete -c termi -l explain -d 'Explain a command'
+complete -c termi -l chat -d 'General chat'
+complete -c termi -l plan -d 'Multi-step plan'
+complete -c termi -l auto -d 'Auto-run plan'
+complete -c termi -l dry-run -d 'Show command only'
+complete -c termi -l model -d 'Override model' -r
+complete -c termi -l no-safety -d 'Disable safety'
+complete -c termi -l list-models -d 'List models'
+complete -c termi -l init-config -d 'Create config'
+complete -c termi -l completions -d 'Generate completions' -r -a 'bash zsh fish'"""
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+
+    # Quick exits before loading config
+    if "-h" in args or "--help" in args:
+        _print_usage()
+        sys.exit(0)
+    if "-v" in args or "-V" in args or "--version" in args:
+        print(f"termi {__version__}")
+        sys.exit(0)
+
+    # Parse flags
+    model_override = None
     if "--model" in args:
         i = args.index("--model")
-        try:
-            model = args[i+1]
-        except IndexError:
-            print_err("Missing model name after --model"); sys.exit(2)
-        args = args[:i] + args[i+2:]
-    if "--dry-run" in args:
-        dry = True
+        if i + 1 < len(args):
+            model_override = args[i + 1]
+            args = args[:i] + args[i + 2:]
+        else:
+            print("Missing model name after --model", file=sys.stderr)
+            sys.exit(2)
+
+    dry = "--dry-run" in args
+    if dry:
         args.remove("--dry-run")
 
-    auto = False
-    if "--auto" in args:
-        auto = True
+    auto = "--auto" in args
+    if auto:
         args.remove("--auto")
 
+    no_safety = "--no-safety" in args
+    if no_safety:
+        args.remove("--no-safety")
+
+    use_stream = "--stream" in args
+    if use_stream:
+        args.remove("--stream")
+
+    no_stream = "--no-stream" in args
+    if no_stream:
+        args.remove("--no-stream")
+
+    # Load config
+    overrides = {}
+    if model_override:
+        overrides["model"] = model_override
+    if no_safety:
+        overrides["safety_confirm"] = False
+    if use_stream:
+        overrides["stream"] = True
+    if no_stream:
+        overrides["stream"] = False
+
+    cfg = load_config(**overrides)
+    con = _get_console(cfg)
+    model = cfg.get("model", "gemma2:2b")
+
+    # Special commands
+    if "--init-config" in args:
+        path = write_default_config()
+        con.print(f"[termi.success]Config written to {path}[/]")
+        sys.exit(0)
+
+    if "--list-models" in args:
+        models = list_ollama_models()
+        if models:
+            for m in models:
+                con.print(f"  {m}")
+        else:
+            con.print("[termi.muted]No models found (is Ollama running?)[/]")
+        sys.exit(0)
+
+    if "--completions" in args:
+        i = args.index("--completions")
+        shell = args[i + 1] if i + 1 < len(args) else "bash"
+        print(_generate_completions(shell))
+        sys.exit(0)
+
+    # Pipe support
+    if not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+        if text:
+            ensure_ollama_installed()
+            ensure_ollama_running(cfg.get("ollama_url", "http://localhost:11434"))
+            ensure_model_available(model)
+            history = History(limit=cfg.get("history_limit", 500))
+            rc = _do_oneshot(text, model, cfg, con, history, dry=dry)
+            sys.exit(rc)
+        sys.exit(0)
+
+    # Bootstrap Ollama
+    ensure_ollama_installed()
+    ensure_ollama_running(cfg.get("ollama_url", "http://localhost:11434"))
+    ensure_model_available(model)
+
+    history = History(limit=cfg.get("history_limit", 500))
+
+    # Handle flags
     if "--explain" in args:
         args.remove("--explain")
         text = " ".join(args).strip()
         if not text:
-            print(HELP); sys.exit(0)
-        try:
-            explain(text, model)
-        except Exception as e:
-            print_err(f"✗ Error during explanation: {e}")
-            sys.exit(1)
+            _print_usage()
+            sys.exit(0)
+        _do_explain(text, model, cfg, con)
         return
 
     if "--chat" in args:
         args.remove("--chat")
         text = " ".join(args).strip()
         if not text:
-            print(HELP); sys.exit(0)
-        try:
-            reply = call_ollama_chat(text, model)
-        except Exception as e:
-            print_err(f"✗ Ollama unavailable; cannot chat without LLM. Error: {e}")
-            sys.exit(1)
-        print(reply)
+            _print_usage()
+            sys.exit(0)
+        chat_history: List[Dict] = []
+        _do_chat(text, model, cfg, con, chat_history)
         return
 
     if "--plan" in args:
         args.remove("--plan")
         text = " ".join(args).strip()
         if not text:
-            print(HELP); sys.exit(0)
-        try:
-            rc = run_plan(text, model, auto=auto, dry_run=dry)
-        except Exception as e:
-            print_err(f"✗ Ollama unavailable; planner requires the LLM. Error: {e}")
-            sys.exit(1)
+            _print_usage()
+            sys.exit(0)
+        rc = _do_plan(text, model, cfg, con, history, auto=auto, dry=dry)
         sys.exit(rc)
 
+    # One-shot or interactive
     text = " ".join(args).strip()
-    if not text:
-        print(HELP); sys.exit(0)
+    if text:
+        if _looks_like_command(text):
+            sys.exit(_run_command(text, cfg.get("shell", "/bin/bash")))
+        rc = _do_oneshot(text, model, cfg, con, history, dry=dry)
+        sys.exit(rc)
 
-    if looks_like_command(text):
-        returncode = run_command(text)
-        sys.exit(returncode)
+    # Interactive mode
+    _interactive(cfg)
 
-    # NL → command (fallback only if Ollama unavailable)
-    try:
-        cmd = call_ollama(text, model)
-    except Exception:
-        cmd = _fallback_command(text)
-        print_err("ℹ︎ Ollama unavailable; using fallback command.")
-    
-    if not cmd:
-        print_err("✗ The model returned no command. Try rephrasing or switch models with --model.")
-        sys.exit(1)
-    
-    print(f"Proposed: {cmd}")
-    if dry or not ask_yes_no("Run this?", default="y"):
-        print("Skipped."); return
-    sys.exit(run_command(cmd))
 
-def interactive():
-    """Run interactive mode with improved error handling."""
-    print("Termi (local LLM copilot). Type natural language or a command. Type :help, :model, :quit.")
-    model = DEFAULT_MODEL
-    while True:
-        try:
-            s = input("termi> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print(); break
-        
-        if not s:
-            continue
-        
-        if s in (":q", ":quit", ":exit"):
-            break
-        if s in (":h", ":help"):
-            print(HELP); continue
-        if s in (":v", ":version"):
-            print(f"termi {__version__}"); continue
-        
-        if s.startswith(":model"):
-            parts = s.split(maxsplit=1)
-            if len(parts)==2:
-                model = parts[1].strip()
-                print(f"✓ model set to {model}")
-            else:
-                print(f"current model: {model}")
-            continue
-        
-        if s.startswith(":explain "):
-            try:
-                explain(s[len(":explain "):].strip(), model)
-            except Exception as e:
-                print_err(f"✗ Error during explanation: {e}")
-            continue
+def _print_usage():
+    print(f"""Termi v{__version__} - Your local terminal copilot
 
-        # Interactive chat & plan
-        if s.startswith(":chat "):
-            msg = s[len(":chat "):].strip()
-            try:
-                ans = call_ollama_chat(msg, model)
-                print(ans)
-            except Exception as e:
-                print_err(f"✗ Ollama unavailable; cannot chat. Error: {e}")
-            continue
+Usage:
+  termi                        Interactive mode
+  termi "text"                 NL -> command -> confirm -> run
+  termi --chat "message"       General chat (multi-turn)
+  termi --plan "task"          Multi-step plan with confirmations
+  termi --auto --plan "task"   Auto-run planned sequence
+  termi --explain "cmd"        Explain a command
+  termi --dry-run "text"       Show command only, don't execute
+  termi --model <name> "text"  Override model
+  termi --no-safety "text"     Skip safety checks
+  termi --stream               Force streaming output
+  termi --no-stream            Force non-streaming output
+  termi --list-models          List available Ollama models
+  termi --init-config          Create default config file
+  termi --completions <shell>  Generate shell completions (bash/zsh/fish)
+  echo "text" | termi          Pipe mode
 
-        if s.startswith(":plan "):
-            task = s[len(":plan "):].strip()
-            try:
-                run_plan(task, model, auto=False, dry_run=False)
-            except Exception as e:
-                print_err(f"✗ Ollama unavailable; planner requires the LLM. Error: {e}")
-            continue
+Config: ~/.config/termi/config.toml
+Env:    TERMI_MODEL, OLLAMA_URL, TERMI_THEME, TERMI_STREAM""")
 
-        if s.startswith(":plan-auto "):
-            task = s[len(":plan-auto "):].strip()
-            try:
-                run_plan(task, model, auto=True, dry_run=False)
-            except Exception as e:
-                print_err(f"✗ Ollama unavailable; planner requires the LLM. Error: {e}")
-            continue
-
-        if looks_like_command(s):
-            run_command(s)
-            continue
-
-        # NL → command (fallback only on Ollama unavailability)
-        try:
-            cmd = call_ollama(s, model)
-            if not cmd:
-                print_err("✗ The model returned no command. Try rephrasing or use :model to switch.")
-                continue
-        except Exception:
-            cmd = _fallback_command(s)
-            print_err("ℹ︎ Ollama unavailable; using fallback command.")
-        
-        print(f"Proposed: {cmd}")
-        if ask_yes_no("Run this?", default="y"):
-            run_command(cmd)
-
-def main():
-    # Handle help/version before Ollama checks
-    if len(sys.argv) > 1:
-        if any(a in ("-h", "--help") for a in sys.argv[1:]):
-            print(HELP)
-            sys.exit(0)
-        if any(a in ("-v", "-V", "--version") for a in sys.argv[1:]):
-            print(f"termi {__version__}")
-            sys.exit(0)
-    
-    ensure_ollama_installed()
-    ensure_ollama_running()
-    ensure_model_available(DEFAULT_MODEL)
-
-    if len(sys.argv) == 1:
-        interactive()
-    else:
-        one_shot(sys.argv[1:])
 
 if __name__ == "__main__":
     main()
