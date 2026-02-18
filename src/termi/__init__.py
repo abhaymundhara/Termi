@@ -1,3 +1,3 @@
-# src/termi_copilot/__init__.py
-__all__ = ["cli"]
-__version__ = "0.1.0"
+"""Termi - local-LLM terminal copilot."""
+__all__ = ["cli", "config", "llm", "safety", "history", "context", "themes"]
+__version__ = "0.3.0"
